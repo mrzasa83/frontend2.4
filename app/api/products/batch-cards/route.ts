@@ -9,6 +9,7 @@ import { buildCardSet } from '@/lib/products/batchCardData'
 import { renderBatchCard } from '@/lib/products/batchCardPdf'
 import { networkUsernameFor } from '@/lib/config/networkUsername'
 import { queryPrimary } from '@/lib/db/mysql-primary'
+import { queryMSSQL } from '@/lib/db/mssql'
 import { hasColumn } from '@/lib/db/schemaProbe'
 import { promises as fs } from 'fs'
 import path from 'path'
@@ -133,6 +134,21 @@ export async function POST(request: NextRequest) {
       } catch { /* fall back to the derived value */ }
       const operator = networkUsernameFor(username, stored)
 
+      // The ID in the header is the Paradigm employee code for that network
+      // name. Matched case-insensitively — the ERP stores it upper case while
+      // the derived value is lower.
+      let employeeId = ''
+      try {
+        const emp = await queryMSSQL<any[]>('1',
+          `SELECT TOP 1 LTRIM(RTRIM(EMPL_CODE)) AS code
+           FROM DATA0005 WITH (NOLOCK)
+           WHERE UPPER(LTRIM(RTRIM(ABBR_NAME))) = UPPER(@abbr)`,
+          { abbr: operator })
+        employeeId = String(emp?.[0]?.code ?? '').trim()
+      } catch (e) {
+        console.error('Employee code lookup failed for', operator, e)
+      }
+
       const cards = await buildCardSet(part)
       if (!cards.length) {
         return NextResponse.json({
@@ -159,7 +175,7 @@ export async function POST(request: NextRequest) {
       for (const card of cards) {
         const safeName = card.partNumber.replace(/[\\/:*?"<>|]/g, '_')
         try {
-          const bytes = await renderBatchCard(card, operator)
+          const bytes = await renderBatchCard(card, { employeeId, operator })
           await fs.writeFile(path.join(loc.fe2Folder!, `${safeName}.pdf`), bytes)
           written++
         } catch (e) {
@@ -168,9 +184,11 @@ export async function POST(request: NextRequest) {
       }
 
       return NextResponse.json({
-        success: true, written, cards: cards.length, operator,
+        success: true, written, cards: cards.length, operator, employeeId,
         failed,
-        message: `Generated ${written} card(s) for ${part}${failed.length ? `, ${failed.length} failed` : ''}.`,
+        message: `Generated ${written} card(s) for ${part} as ${operator}` +
+                 `${employeeId ? ` (ID ${employeeId})` : ' — no Paradigm employee code found for that network name'}` +
+                 `${failed.length ? `, ${failed.length} failed` : ''}.`,
       })
     }
 

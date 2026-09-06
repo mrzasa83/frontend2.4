@@ -9,8 +9,11 @@ import { queryMSSQL } from '@/lib/db/mssql'
  * the route steps with their instructions and parameters — the same shape the
  * Daily Plan renders, which is why the TTYPE handling matches it.
  *
- * TTYPE on DATA0038: 4 is the released customer-part route. Manufactured
- * components carry their own route against the inventory record.
+ * TTYPE on DATA0038, as evidenced by the queries already running in the app:
+ *   2  work-order route          SOURCE_PTR = DATA0006.RKEY  (Daily Plan)
+ *   3  inventory-part route      SOURCE_PTR = DATA0017.RKEY  (related parts)
+ *   4  released customer part    SOURCE_PTR = DATA0050.RKEY  (Products route)
+ *   1  not used anywhere yet — presumed engineering/unreleased
  */
 
 export type RouteStep = {
@@ -273,7 +276,10 @@ export async function buildCardSet(customerPart: string): Promise<CardData[]> {
         productCode: '',
         catalogNumber: clean(h.CATALOG_NUMBER),
         bom: sub.lines,
-        route: await loadRoute(Number(r.rkey), 1),
+        // TTYPE 3 is the inventory-part route, keyed on DATA0017.RKEY — the
+        // same join the Standards "related parts" query uses. TTYPE 1 (my
+        // earlier guess) returns nothing, which is why these came out blank.
+        route: await loadRoute(Number(r.rkey), 3),
         notes: [],
       })
       await walk(sub.children, level + 1)

@@ -75,6 +75,9 @@ RUN apt-get update \
 
 # Copy the Python scanner scripts (not part of the Next standalone bundle)
 COPY --from=builder /app/scripts ./scripts
+# Fonts for generated PDFs. The standalone output doesn't carry non-code assets,
+# so without this the batch card renderer silently falls back to Helvetica.
+COPY --from=builder /app/assets ./assets
 
 # Copy standalone build
 COPY --from=builder /app/.next/standalone ./

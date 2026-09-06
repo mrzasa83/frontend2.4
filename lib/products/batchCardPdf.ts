@@ -1,122 +1,214 @@
-import { PDFDocument, StandardFonts, rgb } from 'pdf-lib'
+import { PDFDocument, PDFFont, PDFPage, StandardFonts, rgb } from 'pdf-lib'
+import fontkit from '@pdf-lib/fontkit'
+import { promises as fs } from 'fs'
+import path from 'path'
 import type { CardData } from './batchCardData'
 
 /**
- * Render one batch card, following the Paradigm "Customer Part Details"
- * printout: header block, bill of material, then the route steps with their
- * instructions and parameters and the IN/DTE · IN/OUT · SCRP/IR boxes the
- * operator fills in.
+ * Batch card, laid out to match the Paradigm "CUSTOMER PART DETAILS" printout.
+ *
+ * The header block repeats on every page — only the page number changes —
+ * because a card gets separated in the shop and any loose sheet has to identify
+ * itself.
  */
 
-const PAGE = { w: 612, h: 792 }        // US Letter, portrait
-const M = 36                           // margin
+const PAGE = { w: 612, h: 792 }   // US Letter portrait
+const M = 40
+const INK = rgb(0.05, 0.05, 0.08)
+const MUTED = rgb(0.42, 0.46, 0.52)
+const RULE = rgb(0.75, 0.79, 0.85)
+const BAND = rgb(0.85, 0.91, 0.97)
 
-export async function renderBatchCard(card: CardData, operator: string): Promise<Uint8Array> {
+/**
+ * DejaVu Sans — metrically close to Verdana and freely licensed, which avoids
+ * shipping a Microsoft font in the image. Embedded from the repo rather than
+ * relying on a system font, since the runner image carries no font packages.
+ * Falls back to Helvetica if the files are missing so a card still renders.
+ */
+async function loadFonts(doc: PDFDocument): Promise<{ regular: PDFFont; bold: PDFFont }> {
+  doc.registerFontkit(fontkit)
+  const dir = path.join(process.cwd(), 'assets', 'fonts')
+  try {
+    const [r, b] = await Promise.all([
+      fs.readFile(path.join(dir, 'DejaVuSans.ttf')),
+      fs.readFile(path.join(dir, 'DejaVuSans-Bold.ttf')),
+    ])
+    return {
+      regular: await doc.embedFont(r, { subset: true }),
+      bold: await doc.embedFont(b, { subset: true }),
+    }
+  } catch {
+    return {
+      regular: await doc.embedFont(StandardFonts.Helvetica),
+      bold: await doc.embedFont(StandardFonts.HelveticaBold),
+    }
+  }
+}
+
+export type CardMeta = {
+  /** DATA0005.EMPL_CODE for the person generating — shown as ID, top right. */
+  employeeId: string
+  operator: string
+}
+
+export async function renderBatchCard(card: CardData, meta: CardMeta): Promise<Uint8Array> {
   const doc = await PDFDocument.create()
-  const font = await doc.embedFont(StandardFonts.Helvetica)
-  const bold = await doc.embedFont(StandardFonts.HelveticaBold)
+  const { regular, bold } = await loadFonts(doc)
 
-  let page = doc.addPage([PAGE.w, PAGE.h])
-  let y = PAGE.h - M
+  const pages: PDFPage[] = []
+  let page!: PDFPage
+  let y = 0
 
-  const line = (text: string, x: number, size = 9, f = font, color = rgb(0.1, 0.1, 0.15)) => {
-    page.drawText(text ?? '', { x, y, size, font: f, color })
+  const text = (s: string, x: number, size: number, f: PDFFont = regular, color = INK) => {
+    // Verdana covers far more than the standard fonts, but a stray control
+    // character would still throw and lose the whole card.
+    page.drawText(String(s ?? '').replace(/[\u0000-\u001F\u007F]/g, ' '), {
+      x, y, size, font: f, color,
+    })
   }
-  const need = (h: number) => {
-    if (y - h < M) { page = doc.addPage([PAGE.w, PAGE.h]); y = PAGE.h - M }
-  }
-  const rule = (color = rgb(0.8, 0.84, 0.9)) => {
+  const rule = (color = RULE) =>
     page.drawLine({ start: { x: M, y }, end: { x: PAGE.w - M, y }, thickness: 0.7, color })
-  }
-  // pdf-lib throws on characters the standard fonts can't encode.
-  const safe = (s: string) => String(s ?? '').replace(/[^\x20-\x7E]/g, ' ')
 
-  // ---- Header ----
-  line('Amphenol Printed Circuits, Inc.', M, 11, bold)
-  line(safe(operator), PAGE.w - M - 120, 9)
-  y -= 13
-  line('BATCH CARD', M, 10, bold)
-  line(new Date().toLocaleString(), PAGE.w - M - 120, 8, font, rgb(0.4, 0.45, 0.5))
-  y -= 14
-  rule(); y -= 12
+  const label = (s: string, x: number, yy: number) =>
+    page.drawText(s, { x, y: yy, size: 7, font: bold, color: MUTED })
 
-  const field = (label: string, value: string, x: number) => {
-    page.drawText(label, { x, y, size: 7.5, font: bold, color: rgb(0.42, 0.46, 0.52) })
-    page.drawText(safe(value) || '-', { x, y: y - 10, size: 9.5, font })
+  /** The block that repeats on every page. Returns the y to continue from. */
+  const drawHeader = () => {
+    let hy = PAGE.h - M
+
+    // Centre column: company, system, document title
+    const centre = (s: string, size: number, f: PDFFont, yy: number) => {
+      const w = f.widthOfTextAtSize(s, size)
+      page.drawText(s, { x: (PAGE.w - w) / 2, y: yy, size, font: f, color: INK })
+    }
+    centre('Amphenol Printed Circuits, Inc.', 10, bold, hy)
+    // Right column: ID / Page / timestamp
+    page.drawText(`ID : ${meta.employeeId || '-'}`, { x: PAGE.w - M - 120, y: hy, size: 8, font: regular, color: INK })
+    hy -= 11
+    centre('4.0 Live', 8, regular, hy)
+    page.drawText(`Page : ${pages.length}`, { x: PAGE.w - M - 120, y: hy, size: 8, font: regular, color: INK })
+    hy -= 11
+    centre('BATCH CARD', 10, bold, hy)
+    page.drawText(new Date().toLocaleString(), { x: PAGE.w - M - 120, y: hy, size: 8, font: regular, color: INK })
+    hy -= 16
+
+    // Left-aligned field block, labels right-aligned against their values
+    const row = (lbl: string, val: string, lbl2?: string, val2?: string) => {
+      const lw = bold.widthOfTextAtSize(lbl, 8)
+      page.drawText(lbl, { x: 150 - lw, y: hy, size: 8, font: bold, color: INK })
+      page.drawText(String(val ?? ''), { x: 156, y: hy, size: 8, font: regular, color: INK })
+      if (lbl2) {
+        const lw2 = bold.widthOfTextAtSize(lbl2, 8)
+        page.drawText(lbl2, { x: 470 - lw2, y: hy, size: 8, font: bold, color: INK })
+        page.drawText(String(val2 ?? ''), { x: 476, y: hy, size: 8, font: regular, color: INK })
+      }
+      hy -= 11
+    }
+    row('Customer :', `${card.customerCode}   ${card.customerName}`)
+    row('Part Number :', card.partNumber, 'Part Revision :', card.revision)
+    row('Part Description :', card.description)
+    row('BOM Number :', card.bomNumber, 'BOM Revision :', '')
+    row('BOM Description :', card.bomDescription)
+    if (card.routeName) row('Route :', card.routeName)
+
+    hy -= 4
+    page.drawLine({ start: { x: M, y: hy }, end: { x: PAGE.w - M, y: hy }, thickness: 1, color: INK })
+    return hy - 14
   }
-  field('CUSTOMER', `${card.customerCode} ${card.customerName}`, M)
-  field('PART NUMBER', card.partNumber, M + 250)
-  field('REVISION', card.revision, M + 430)
-  y -= 26
-  field('DESCRIPTION', card.description, M)
-  field('BOM NUMBER', card.bomNumber, M + 250)
-  field('ROUTE', card.routeName, M + 430)
-  y -= 26
-  rule(); y -= 14
+
+  const newPage = () => {
+    page = doc.addPage([PAGE.w, PAGE.h])
+    pages.push(page)
+    y = drawHeader()
+  }
+  const need = (h: number) => { if (y - h < M) newPage() }
+
+  newPage()
 
   // ---- Bill of material ----
   if (card.bom.length) {
-    line('Bill of Material', M, 9.5, bold, rgb(0.15, 0.35, 0.65)); y -= 12
-    line('Part Number', M, 7.5, bold, rgb(0.42, 0.46, 0.52))
-    line('Description', M + 120, 7.5, bold, rgb(0.42, 0.46, 0.52))
-    line('Unit', M + 300, 7.5, bold, rgb(0.42, 0.46, 0.52))
-    line('Required/BOM', M + 350, 7.5, bold, rgb(0.42, 0.46, 0.52))
-    line('Qty Required', M + 450, 7.5, bold, rgb(0.42, 0.46, 0.52))
-    y -= 11
+    need(30)
+    page.drawRectangle({ x: M, y: y - 3, width: PAGE.w - 2 * M, height: 13, color: BAND })
+    text('Bill of Material', (PAGE.w / 2) - 32, 8.5, bold)
+    y -= 15
+    label('Part Number', M, y); label('Part Description', M + 110, y)
+    label('Unit', M + 270, y); label('Required/BOM', M + 310, y)
+    label('Qty Required', M + 400, y)
+    y -= 3; rule(); y -= 10
     for (const b of card.bom) {
-      need(14)
-      line(safe(b.partNumber), M, 8.5)
-      line(safe(b.description).slice(0, 30), M + 120, 8.5)
-      line(safe(b.unit), M + 300, 8.5)
-      line(b.requiredPer, M + 350, 8.5)
-      line(b.qtyRequired, M + 450, 8.5)
-      y -= 12
+      need(12)
+      text(b.partNumber, M, 8)
+      text(b.description.slice(0, 28), M + 110, 8)
+      text(b.unit, M + 270, 8)
+      text(b.requiredPer, M + 310, 8)
+      text(b.qtyRequired, M + 400, 8)
+      y -= 11
     }
     y -= 6
   }
 
-  // ---- Route ----
+  // ---- Route steps ----
   for (const s of card.route) {
-    need(34)
-    rule(rgb(0.88, 0.9, 0.94)); y -= 12
-    line(`Step : ${s.step}`, M, 9.5, bold)
-    line(safe(s.dept), M + 80, 9.5, bold)
-    line(safe(s.deptCode), M + 320, 9.5, bold)
-    // The boxes the operator signs off in.
-    const bx = PAGE.w - M - 168
-    for (let i = 0; i < 3; i++) {
-      const label = ['IN/DTE', 'IN/OUT', 'SCRP/IR'][i]
-      page.drawText(label, { x: bx + i * 56, y: y + 11, size: 6, font: bold, color: rgb(0.42, 0.46, 0.52) })
+    need(30)
+    text(`Step : ${s.step}`, M + 14, 9, bold)
+    text(s.dept, M + 90, 9, bold)
+    text(s.deptCode, M + 330, 9, bold)
+    // Sign-off boxes
+    const bx = PAGE.w - M - 174
+    ;['IN/DTE', 'IN/OUT', 'SCRP/IR'].forEach((l, i) => {
+      page.drawText(l, { x: bx + i * 58 + 8, y: y + 11, size: 6, font: bold, color: MUTED })
       page.drawRectangle({
-        x: bx + i * 56, y: y - 4, width: 52, height: 14,
-        borderColor: rgb(0.6, 0.65, 0.72), borderWidth: 0.7,
+        x: bx + i * 58, y: y - 5, width: 54, height: 15,
+        borderColor: RULE, borderWidth: 0.7,
       })
+    })
+    y -= 18
+
+    if (s.params.length) {
+      need(24)
+      page.drawRectangle({ x: M, y: y - 3, width: PAGE.w - 2 * M, height: 12, color: BAND })
+      text('Route Step Parameters', (PAGE.w / 2) - 45, 8, bold)
+      y -= 14
+      for (const p of s.params) {
+        need(11)
+        text(`${p.name} : ${p.value}`, M + 20, 7.5, regular, rgb(0.2, 0.24, 0.3))
+        y -= 10
+      }
+      y -= 2
     }
-    y -= 16
     for (const i of s.instructions) {
       need(11)
-      line(safe(i).slice(0, 110), M + 12, 8, font, rgb(0.25, 0.3, 0.36))
-      y -= 10
-    }
-    if (s.params.length) {
-      need(11)
-      const text = s.params.map(p => `${safe(p.name)}: ${safe(p.value)}`).join('   ')
-      line(text.slice(0, 110), M + 12, 8, font, rgb(0.3, 0.35, 0.42))
+      text(i.slice(0, 120), M + 20, 7.5, regular, rgb(0.2, 0.24, 0.3))
       y -= 10
     }
   }
 
-  // ---- Notes ----
+  // ---- Discrepancy sheet ----
   if (card.notes.length) {
-    need(24)
-    y -= 6; rule(); y -= 12
-    line('Discrepancy Sheet', M, 9.5, bold, rgb(0.15, 0.35, 0.65)); y -= 12
+    need(30)
+    y -= 4
+    page.drawRectangle({ x: M, y: y - 3, width: PAGE.w - 2 * M, height: 13, color: BAND })
+    text('Discrepancy Sheet', (PAGE.w / 2) - 36, 8.5, bold)
+    y -= 16
     for (const n of card.notes) {
       need(11)
-      line(safe(n).slice(0, 115), M, 8, font, rgb(0.25, 0.3, 0.36))
+      text(n.slice(0, 125), M + 4, 7.5, regular, rgb(0.2, 0.24, 0.3))
       y -= 10
     }
   }
+
+  // Footer on every page, with the final page count known only now.
+  pages.forEach((p, i) => {
+    p.drawText('Copyright © 1988 - 2026 Aptean', { x: M, y: 24, size: 7, font: regular, color: MUTED })
+    const right = `Paradigm® Version 4.0`
+    p.drawText(right, {
+      x: PAGE.w - M - regular.widthOfTextAtSize(right, 7), y: 24, size: 7, font: regular, color: MUTED,
+    })
+    // Page N of M, sitting under the header's Page label
+    p.drawText(`${i + 1} of ${pages.length}`, {
+      x: PAGE.w - M - 60, y: PAGE.h - M - 11, size: 8, font: regular, color: INK,
+    })
+  })
 
   return await doc.save()
 }
