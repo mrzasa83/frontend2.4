@@ -86,8 +86,10 @@ const HEADER_SQL = `
     LTRIM(RTRIM(d5m.EMPL_CODE))               AS MODIFIED_BY_CODE,
     LTRIM(RTRIM(d5m.EMPLOYEE_NAME))           AS MODIFIED_BY_NAME,
     d50.LAST_MODIFIED_DATE                    AS MODIFIED_DATE,
-    -- "Entered By" is whoever last modified the PRODUCTION part this row
-    -- points at through PRODUCTION_PART_PTR.
+    -- "Entered By" comes from the SALES part, not this row: both rows share a
+    -- PRODUCTION_PART_PTR, and the production part is the one whose own RKEY
+    -- equals that pointer. The sibling is the sales part, and its
+    -- LAST_MODIFIED_BY_PTR is who entered the job.
     LTRIM(RTRIM(d5e.EMPL_CODE))               AS ENTERED_BY_CODE,
     LTRIM(RTRIM(d5e.EMPLOYEE_NAME))           AS ENTERED_BY_NAME,
     d50.CUSTPART_ENT_DATE                     AS ENTERED_DATE
@@ -98,8 +100,14 @@ const HEADER_SQL = `
   LEFT JOIN DATA0037 d37 WITH (NOLOCK) ON d37.RKEY = d50.PROD_ROUTE_PTR
   LEFT JOIN DATA0008 d8  WITH (NOLOCK) ON d8.RKEY  = d50.PROD_CODE_PTR
   LEFT JOIN DATA0005 d5m WITH (NOLOCK) ON d5m.RKEY = d50.LAST_MODIFIED_BY_PTR
-  LEFT JOIN DATA0050 d50p WITH (NOLOCK) ON d50p.RKEY = d50.PRODUCTION_PART_PTR
-  LEFT JOIN DATA0005 d5e WITH (NOLOCK) ON d5e.RKEY = d50p.LAST_MODIFIED_BY_PTR
+  OUTER APPLY (
+      SELECT TOP 1 sp.LAST_MODIFIED_BY_PTR
+      FROM DATA0050 sp WITH (NOLOCK)
+      WHERE sp.PRODUCTION_PART_PTR = d50.PRODUCTION_PART_PTR
+        AND sp.RKEY <> sp.PRODUCTION_PART_PTR      -- exclude the production part itself
+      ORDER BY sp.RKEY
+  ) salespart
+  LEFT JOIN DATA0005 d5e WITH (NOLOCK) ON d5e.RKEY = salespart.LAST_MODIFIED_BY_PTR
   -- The stored number carries a status suffix ("12807 INPROCESS"), so an exact
   -- match finds nothing. A bare LIKE '12807%' is wrong too — it would also
   -- match 128070, a different part, and pick it when the plain number doesn't
@@ -315,9 +323,17 @@ export async function buildCardSet(customerPart: string): Promise<CardData[]> {
       .sort((a, b) => (parseInt(a.replace(/\D+/g, ''), 10) || 0) - (parseInt(b.replace(/\D+/g, ''), 10) || 0))
       .map(k => {
         const n = parseInt(k.replace(/\D+/g, ''), 10) || 0
-        return { name: labels[n - 1] || k.replace(/_/g, ' '), value: clean(row[k]) }
+        return {
+          name: labels[n - 1] || '',
+          value: clean(row[k]),
+          captioned: !!labels[n - 1],
+        }
       })
-      .filter(p => p.value !== '')
+      // Every captioned row prints, blank or not — the printout lists them all,
+      // and a missing line reads as a missing parameter rather than an empty
+      // one. Positions with no caption only appear if they carry a value.
+      .filter(p => p.captioned || p.value !== '')
+      .map(({ name, value }, i) => ({ name: name || `#${i + 1}`, value }))
   }
 
   const rkey = Number(h.RKEY ?? 0)

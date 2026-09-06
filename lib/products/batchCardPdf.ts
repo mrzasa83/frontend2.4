@@ -116,16 +116,20 @@ export async function renderBatchCard(card: CardData, meta: CardMeta): Promise<U
 
     // Left field block: labels right-aligned to a colon column.
     const L_COLON = 150
-    const row = (lbl: string, val: string, lblBold = true, lbl2?: string, val2?: string) => {
+    const row = (
+      lbl: string, val: string, lblBold = true,
+      lbl2?: string, val2?: string, lbl2Bold = true,
+    ) => {
       const f = lblBold ? monoBold : mono
       const w = f.widthOfTextAtSize(lbl, 8)
       page.drawText(lbl, { x: L_COLON - 4 - w, y: hy, size: 8, font: f, color: INK })
       page.drawText(':', { x: L_COLON, y: hy, size: 8, font: f, color: INK })
       page.drawText(String(val ?? ''), { x: L_COLON + 8, y: hy, size: 8, font: mono, color: INK })
       if (lbl2) {
-        const w2 = monoBold.widthOfTextAtSize(lbl2, 8)
-        page.drawText(lbl2, { x: 470 - w2, y: hy, size: 8, font: monoBold, color: INK })
-        page.drawText(':', { x: 474, y: hy, size: 8, font: monoBold, color: INK })
+        const f2 = lbl2Bold ? monoBold : mono
+        const w2 = f2.widthOfTextAtSize(lbl2, 8)
+        page.drawText(lbl2, { x: 470 - w2, y: hy, size: 8, font: f2, color: INK })
+        page.drawText(':', { x: 474, y: hy, size: 8, font: f2, color: INK })
         page.drawText(String(val2 ?? ''), { x: 482, y: hy, size: 8, font: mono, color: INK })
       }
       hy -= 11
@@ -142,11 +146,12 @@ export async function renderBatchCard(card: CardData, meta: CardMeta): Promise<U
           undefined, undefined)
     }
     if (card.productCode || card.productName) {
-      row('Product Code', `${card.productCode}   ${card.productName}`.trim(), false)
+      // Catalog Number sits in the right column on this line; neither label is
+      // bold on the original.
+      row('Product Code', `${card.productCode}   ${card.productName}`.trim(), false,
+          card.catalogNumber ? 'Catalog Number' : undefined, card.catalogNumber, false)
     }
-    if (card.catalogNumber) {
-      row('Catalog Number', card.catalogNumber, true)
-    }
+
     if (card.enteredBy || card.enteredDate) {
       row('Entered By', card.enteredBy, true, 'Entered Date', card.enteredDate)
     }
@@ -176,20 +181,12 @@ export async function renderBatchCard(card: CardData, meta: CardMeta): Promise<U
     y -= 16
   }
 
-  // Two-column list, for the parameter / spec blocks.
+  // Single column, as on the original printout: label, then value.
   const pairs = (list: { name: string; value: string }[]) => {
-    const half = Math.ceil(list.length / 2)
-    for (let i = 0; i < half; i++) {
+    for (const p of list) {
       need(11)
-      const a = list[i], b = list[i + half]
-      if (a) {
-        text(a.name, M + 6, 7, regular, MUTED)
-        text(a.value, M + 120, 7.5)
-      }
-      if (b) {
-        text(b.name, M + 290, 7, regular, MUTED)
-        text(b.value, M + 400, 7.5)
-      }
+      text(p.name, M + 6, 7.5, mono, MUTED)
+      text(p.value, M + 170, 7.5, mono)
       y -= 10
     }
     y -= 4
