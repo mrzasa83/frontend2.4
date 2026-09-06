@@ -50,6 +50,8 @@ export type CardData = {
   catalogNumber: string
   modifiedBy: string
   modifiedDate: string
+  enteredBy: string
+  enteredDate: string
   bom: BomLine[]
   route: RouteStep[]
   notes: string[]
@@ -83,7 +85,12 @@ const HEADER_SQL = `
     -- Who last touched it, and when
     LTRIM(RTRIM(d5m.EMPL_CODE))               AS MODIFIED_BY_CODE,
     LTRIM(RTRIM(d5m.EMPLOYEE_NAME))           AS MODIFIED_BY_NAME,
-    d50.LAST_MODIFIED_DATE                    AS MODIFIED_DATE
+    d50.LAST_MODIFIED_DATE                    AS MODIFIED_DATE,
+    -- "Entered By" is whoever last modified the PRODUCTION part this row
+    -- points at through PRODUCTION_PART_PTR.
+    LTRIM(RTRIM(d5e.EMPL_CODE))               AS ENTERED_BY_CODE,
+    LTRIM(RTRIM(d5e.EMPLOYEE_NAME))           AS ENTERED_BY_NAME,
+    d50.CUSTPART_ENT_DATE                     AS ENTERED_DATE
   FROM DATA0050 d50 WITH (NOLOCK)
   LEFT JOIN DATA0010 d10 WITH (NOLOCK) ON d10.RKEY = d50.CUSTOMER_PTR
   LEFT JOIN DATA0025 d25 WITH (NOLOCK) ON d25.RKEY = d50.BOM_PTR
@@ -91,6 +98,8 @@ const HEADER_SQL = `
   LEFT JOIN DATA0037 d37 WITH (NOLOCK) ON d37.RKEY = d50.PROD_ROUTE_PTR
   LEFT JOIN DATA0008 d8  WITH (NOLOCK) ON d8.RKEY  = d50.PROD_CODE_PTR
   LEFT JOIN DATA0005 d5m WITH (NOLOCK) ON d5m.RKEY = d50.LAST_MODIFIED_BY_PTR
+  LEFT JOIN DATA0050 d50p WITH (NOLOCK) ON d50p.RKEY = d50.PRODUCTION_PART_PTR
+  LEFT JOIN DATA0005 d5e WITH (NOLOCK) ON d5e.RKEY = d50p.LAST_MODIFIED_BY_PTR
   -- The stored number carries a status suffix ("12807 INPROCESS"), so an exact
   -- match finds nothing. A bare LIKE '12807%' is wrong too — it would also
   -- match 128070, a different part, and pick it when the plain number doesn't
@@ -186,6 +195,26 @@ const ROUTE_SQL = `
  *   DATA0045  PROD_SPEC_01..20   customer part specifications
  *   DATA0047  unit values, joined to DATA0002 for the unit and its description
  */
+/**
+ * Labels for the numbered parameter and spec columns, read off the Paradigm
+ * printout for 12807. Paradigm stores only the values — the captions live in
+ * its own configuration — so these are positional.
+ *
+ * If a caption looks wrong on a card, it's this list that needs correcting,
+ * not the query.
+ */
+const PARA_LABELS = [
+  'MN SPACING', 'MIN AN RIN', 'FLBDTK +/-', 'CIRC SIZE', '# PROC PCS',
+  '# OF LYRS', '# UP', 'PANEL SIZE', '# UP/ARRAY', 'PART TYPE',
+]
+
+const SPEC_LABELS = [
+  'MATERIAL', 'WELDABLE', 'LAB', 'BASE SPEC', 'EC SPEC',
+  'CM SPEC', 'END CUST', 'EC PART #', 'EC REV', 'PREV PART#',
+  'ENGINEER', 'FOLDER', 'EDGE DIST', 'MFG DWG #', 'HOMOGENOUS',
+  'APC TOP LVL P/N', 'COST_PROD_CODE', 'SPEC 18', 'SPEC 19', 'SPEC 20',
+]
+
 const PARAMS_SQL = `
   SELECT TOP 1 * FROM DATA0044 WITH (NOLOCK)
   WHERE SOURCE_PTR = @rkey AND SOURCE_TYPE = 2`
@@ -197,7 +226,7 @@ const SPECS_SQL = `
 const UNITS_SQL = `
   SELECT
     LTRIM(RTRIM(d2.UNIT_CODE))        AS unitCode,
-    LTRIM(RTRIM(d2.UNIT_DESCRIPTION)) AS unitDescription,
+    LTRIM(RTRIM(d2.UNIT_NAME))        AS unitDescription,
     d47.UNIT_VALUE                    AS unitValue
   FROM DATA0047 d47 WITH (NOLOCK)
   LEFT JOIN DATA0002 d2 WITH (NOLOCK) ON d2.RKEY = d47.UNIT_POINTER
@@ -279,12 +308,15 @@ export async function buildCardSet(customerPart: string): Promise<CardData[]> {
    * differs between Paradigm versions and a missing column would fail the
    * whole query.
    */
-  const numbered = (row: any, prefix: RegExp) => {
+  const numbered = (row: any, prefix: RegExp, labels: string[]) => {
     if (!row) return []
     return Object.keys(row)
       .filter(k => prefix.test(k))
       .sort((a, b) => (parseInt(a.replace(/\D+/g, ''), 10) || 0) - (parseInt(b.replace(/\D+/g, ''), 10) || 0))
-      .map(k => ({ name: k.replace(/_/g, ' '), value: clean(row[k]) }))
+      .map(k => {
+        const n = parseInt(k.replace(/\D+/g, ''), 10) || 0
+        return { name: labels[n - 1] || k.replace(/_/g, ' '), value: clean(row[k]) }
+      })
       .filter(p => p.value !== '')
   }
 
@@ -316,11 +348,13 @@ export async function buildCardSet(customerPart: string): Promise<CardData[]> {
     catalogNumber: clean(h.CATALOG_NUMBER),
     modifiedBy: [clean(h.MODIFIED_BY_CODE), clean(h.MODIFIED_BY_NAME)].filter(Boolean).join(' '),
     modifiedDate: h.MODIFIED_DATE ? new Date(h.MODIFIED_DATE).toLocaleDateString() : '',
+    enteredBy: [clean(h.ENTERED_BY_CODE), clean(h.ENTERED_BY_NAME)].filter(Boolean).join(' '),
+    enteredDate: h.ENTERED_DATE ? new Date(h.ENTERED_DATE).toLocaleDateString() : '',
     bom: topBom.lines,
     route: topRoute,
     notes: (notes || []).map(n => clean(n.text)).filter(Boolean),
-    parameters: numbered(paraRow?.[0], /^PROD_PARA_\d+$/i),
-    specs: numbered(specRow?.[0], /^PROD_SPEC_\d+$/i),
+    parameters: numbered(paraRow?.[0], /^PROD_PARA_\d+$/i, PARA_LABELS),
+    specs: numbered(specRow?.[0], /^PROD_SPEC_\d+$/i, SPEC_LABELS),
     units: (unitRows || []).map(u => ({
       code: clean(u.unitCode),
       description: clean(u.unitDescription),
@@ -360,6 +394,8 @@ export async function buildCardSet(customerPart: string): Promise<CardData[]> {
         catalogNumber: clean(h.CATALOG_NUMBER),
         modifiedBy: '',
         modifiedDate: '',
+        enteredBy: '',
+        enteredDate: '',
         bom: sub.lines,
         // TTYPE 3 is the inventory-part route, keyed on DATA0017.RKEY — the
         // same join the Standards "related parts" query uses. TTYPE 1 (my

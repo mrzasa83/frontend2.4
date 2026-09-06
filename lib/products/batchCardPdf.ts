@@ -147,6 +147,9 @@ export async function renderBatchCard(card: CardData, meta: CardMeta): Promise<U
     if (card.catalogNumber) {
       row('Catalog Number', card.catalogNumber, true)
     }
+    if (card.enteredBy || card.enteredDate) {
+      row('Entered By', card.enteredBy, true, 'Entered Date', card.enteredDate)
+    }
     if (card.modifiedBy || card.modifiedDate) {
       row('Last Modified By', card.modifiedBy, true, 'Modified Date', card.modifiedDate)
     }
