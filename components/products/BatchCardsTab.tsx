@@ -97,6 +97,12 @@ export default function BatchCardsTab({ partNumber }: { partNumber: string }) {
               {data.fe2Folder}
             </p>
           )}
+          {/* These are files on disk, not a live view. An app update changes how
+              cards are BUILT, not cards already built — which is easy to
+              mistake for the update not having landed. */}
+          <p className="text-xs text-slate-400 mt-0.5">
+            Cards are saved PDFs — regenerate to pick up layout or data changes.
+          </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           {archived.length > 0 && (
