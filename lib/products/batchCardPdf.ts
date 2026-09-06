@@ -192,6 +192,16 @@ export async function renderBatchCard(card: CardData, meta: CardMeta): Promise<U
     y -= 4
   }
 
+  if (card.comments.length) {
+    band('Part Data Comments')
+    for (const line of card.comments) {
+      need(11)
+      text(line.slice(0, 120), M + 6, 7.5, mono, rgb(0.2, 0.24, 0.3))
+      y -= 10
+    }
+    y -= 4
+  }
+
   if (card.parameters.length) { band('Production Part Parameters'); pairs(card.parameters) }
   if (card.specs.length) { band('Customer Part Specifications'); pairs(card.specs) }
   if (card.units.length) {

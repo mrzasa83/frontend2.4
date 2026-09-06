@@ -55,6 +55,7 @@ export type CardData = {
   bom: BomLine[]
   route: RouteStep[]
   notes: string[]
+  comments: string[]
   parameters: { name: string; value: string }[]
   specs: { name: string; value: string }[]
   units: { code: string; description: string; value: string }[]
@@ -86,10 +87,9 @@ const HEADER_SQL = `
     LTRIM(RTRIM(d5m.EMPL_CODE))               AS MODIFIED_BY_CODE,
     LTRIM(RTRIM(d5m.EMPLOYEE_NAME))           AS MODIFIED_BY_NAME,
     d50.LAST_MODIFIED_DATE                    AS MODIFIED_DATE,
-    -- "Entered By" comes from the SALES part, not this row: both rows share a
-    -- PRODUCTION_PART_PTR, and the production part is the one whose own RKEY
-    -- equals that pointer. The sibling is the sales part, and its
-    -- LAST_MODIFIED_BY_PTR is who entered the job.
+    -- "Entered By" comes from the SALES part, not this row. The sales part is
+    -- the child whose PRODUCTION_PART_PTR points at this row's RKEY; the
+    -- production part itself is excluded because its pointer equals its own key.
     LTRIM(RTRIM(d5e.EMPL_CODE))               AS ENTERED_BY_CODE,
     LTRIM(RTRIM(d5e.EMPLOYEE_NAME))           AS ENTERED_BY_NAME,
     d50.CUSTPART_ENT_DATE                     AS ENTERED_DATE
@@ -100,14 +100,12 @@ const HEADER_SQL = `
   LEFT JOIN DATA0037 d37 WITH (NOLOCK) ON d37.RKEY = d50.PROD_ROUTE_PTR
   LEFT JOIN DATA0008 d8  WITH (NOLOCK) ON d8.RKEY  = d50.PROD_CODE_PTR
   LEFT JOIN DATA0005 d5m WITH (NOLOCK) ON d5m.RKEY = d50.LAST_MODIFIED_BY_PTR
-  OUTER APPLY (
-      SELECT TOP 1 sp.LAST_MODIFIED_BY_PTR
-      FROM DATA0050 sp WITH (NOLOCK)
-      WHERE sp.PRODUCTION_PART_PTR = d50.PRODUCTION_PART_PTR
-        AND sp.RKEY <> sp.PRODUCTION_PART_PTR      -- exclude the production part itself
-      ORDER BY sp.RKEY
-  ) salespart
-  LEFT JOIN DATA0005 d5e WITH (NOLOCK) ON d5e.RKEY = salespart.LAST_MODIFIED_BY_PTR
+  -- The sales part is the CHILD row pointing back at this one, and it must not
+  -- be the production part itself (whose pointer equals its own key).
+  LEFT JOIN DATA0050 child WITH (NOLOCK)
+         ON child.PRODUCTION_PART_PTR = d50.RKEY
+        AND child.RKEY <> child.PRODUCTION_PART_PTR
+  LEFT JOIN DATA0005 d5e WITH (NOLOCK) ON d5e.RKEY = child.LAST_MODIFIED_BY_PTR
   -- The stored number carries a status suffix ("12807 INPROCESS"), so an exact
   -- match finds nothing. A bare LIKE '12807%' is wrong too — it would also
   -- match 128070, a different part, and pick it when the plain number doesn't
@@ -241,6 +239,21 @@ const UNITS_SQL = `
   WHERE d47.SOURCE_POINTER = @rkey AND d47.TTYPE = 2
   ORDER BY d2.UNIT_CODE`
 
+/**
+ * Part Data Comments — the free-text block on page 1 of the printout.
+ *
+ * Same table as the purchased-part notepad (DATA0011), keyed on the customer
+ * part with SOURCE_TYPE 2050. The text is split across fixed-width
+ * NOTE_PAD_LINE_n columns, so the row is selected wholesale and the lines
+ * reassembled in column order — the number of line columns isn't hard-coded.
+ *
+ * Distinct from the Discrepancy Sheet below, which lives in DATA0211.
+ */
+const COMMENTS_SQL = `
+  SELECT * FROM DATA0011 WITH (NOLOCK)
+  WHERE FILE_POINTER = @rkey AND SOURCE_TYPE = 2050
+  ORDER BY RKEY`
+
 /** Notepad / discrepancy text for a customer part. */
 const NOTES_SQL = `
   SELECT LTRIM(RTRIM(d211.NOTEPAD_TEXT)) AS text
@@ -337,11 +350,29 @@ export async function buildCardSet(customerPart: string): Promise<CardData[]> {
   }
 
   const rkey = Number(h.RKEY ?? 0)
-  const [paraRow, specRow, unitRows] = await Promise.all([
+  const [paraRow, specRow, unitRows, commentRows] = await Promise.all([
     queryMSSQL<any[]>('1', PARAMS_SQL, { rkey }).catch(() => []),
     queryMSSQL<any[]>('1', SPECS_SQL, { rkey }).catch(() => []),
     queryMSSQL<any[]>('1', UNITS_SQL, { rkey }).catch(() => []),
+    queryMSSQL<any[]>('1', COMMENTS_SQL, { rkey }).catch(() => []),
   ])
+
+  /**
+   * Reassemble NOTE_PAD_LINE_n into lines. Columns are fixed width and Paradigm
+   * breaks mid-word at the boundary, so each is right-trimmed and kept in
+   * numeric order (line 10 after line 2, not between 1 and 2).
+   */
+  const notepadLines = (rows: any[]): string[] => {
+    const out: string[] = []
+    for (const row of rows || []) {
+      const keys = Object.keys(row)
+        .filter(k => /^NOTE_?PAD_?LINE_?\d+$/i.test(k))
+        .sort((a, b) => (parseInt(a.replace(/\D+/g, ''), 10) || 0) - (parseInt(b.replace(/\D+/g, ''), 10) || 0))
+      for (const k of keys) out.push(String(row[k] ?? '').replace(/\s+$/, ''))
+    }
+    while (out.length && !out[out.length - 1].trim()) out.pop()
+    return out
+  }
 
   // Top card — the customer part.
   const topBom = await bomLines(Number(h.BOM_PTR))
@@ -369,6 +400,7 @@ export async function buildCardSet(customerPart: string): Promise<CardData[]> {
     bom: topBom.lines,
     route: topRoute,
     notes: (notes || []).map(n => clean(n.text)).filter(Boolean),
+    comments: notepadLines(commentRows || []),
     parameters: numbered(paraRow?.[0], /^PROD_PARA_\d+$/i, PARA_LABELS),
     specs: numbered(specRow?.[0], /^PROD_SPEC_\d+$/i, SPEC_LABELS),
     units: (unitRows || []).map(u => ({
@@ -418,6 +450,7 @@ export async function buildCardSet(customerPart: string): Promise<CardData[]> {
         // earlier guess) returns nothing, which is why these came out blank.
         route: await loadRoute(Number(r.rkey), 3),
         notes: [],
+        comments: [],
         parameters: [],
         specs: [],
         units: [],
