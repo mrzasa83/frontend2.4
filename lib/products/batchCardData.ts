@@ -43,12 +43,19 @@ export type CardData = {
   customerName: string
   bomNumber: string
   bomDescription: string
+  routeCode: string
   routeName: string
   productCode: string
+  productName: string
   catalogNumber: string
+  modifiedBy: string
+  modifiedDate: string
   bom: BomLine[]
   route: RouteStep[]
   notes: string[]
+  parameters: { name: string; value: string }[]
+  specs: { name: string; value: string }[]
+  units: { code: string; description: string; value: string }[]
 }
 
 const clean = (v: any) => String(v ?? '').trim()
@@ -62,14 +69,28 @@ const HEADER_SQL = `
   SELECT TOP 1
     d50.RKEY,
     d50.CUSTOMER_PART_NUMBER, d50.CUSTOMER_PART_DESC, d50.CP_REV,
-    d50.CATALOG_NUMBER, d50.BOM_PTR,
+    LTRIM(RTRIM(d50.CATALOG_NUMBER))          AS CATALOG_NUMBER,
+    d50.BOM_PTR,
     d10.CUST_CODE, d10.CUSTOMER_NAME,
-    LTRIM(RTRIM(d17.INV_PART_NUMBER))      AS BOM_PART,
-    LTRIM(RTRIM(d17.INV_PART_DESCRIPTION)) AS BOM_DESC
+    LTRIM(RTRIM(d17.INV_PART_NUMBER))         AS BOM_PART,
+    LTRIM(RTRIM(d17.INV_PART_DESCRIPTION))    AS BOM_DESC,
+    -- Production route: code and name are separate columns on DATA0037
+    LTRIM(RTRIM(d37.PROD_ROUTE_CODE))         AS ROUTE_CODE,
+    LTRIM(RTRIM(d37.PROD_ROUTE_CODE_NAME))    AS ROUTE_NAME,
+    -- Product code and its description, from DATA0008
+    LTRIM(RTRIM(d8.PROD_CODE))                AS PROD_CODE,
+    LTRIM(RTRIM(d8.PRODUCT_NAME))             AS PROD_NAME,
+    -- Who last touched it, and when
+    LTRIM(RTRIM(d5m.EMPL_CODE))               AS MODIFIED_BY_CODE,
+    LTRIM(RTRIM(d5m.EMPLOYEE_NAME))           AS MODIFIED_BY_NAME,
+    d50.LAST_MODIFIED_DATE                    AS MODIFIED_DATE
   FROM DATA0050 d50 WITH (NOLOCK)
   LEFT JOIN DATA0010 d10 WITH (NOLOCK) ON d10.RKEY = d50.CUSTOMER_PTR
   LEFT JOIN DATA0025 d25 WITH (NOLOCK) ON d25.RKEY = d50.BOM_PTR
   LEFT JOIN DATA0017 d17 WITH (NOLOCK) ON d17.RKEY = d25.INVENTORY_PTR
+  LEFT JOIN DATA0037 d37 WITH (NOLOCK) ON d37.RKEY = d50.PROD_ROUTE_PTR
+  LEFT JOIN DATA0008 d8  WITH (NOLOCK) ON d8.RKEY  = d50.PROD_CODE_PTR
+  LEFT JOIN DATA0005 d5m WITH (NOLOCK) ON d5m.RKEY = d50.LAST_MODIFIED_BY_PTR
   -- The stored number carries a status suffix ("12807 INPROCESS"), so an exact
   -- match finds nothing. A bare LIKE '12807%' is wrong too — it would also
   -- match 128070, a different part, and pick it when the plain number doesn't
@@ -156,6 +177,33 @@ const ROUTE_SQL = `
   WHERE d38.SOURCE_PTR = @sourcePtr AND d38.TTYPE = @ttype
   ORDER BY d38.STEP_NUMBER`
 
+/**
+ * Production parameters, customer part specifications and unit loading
+ * factors — the three blocks on page 1/2 of the Paradigm printout.
+ *
+ * All three hang off the customer part with a source type of 2:
+ *   DATA0044  PROD_PARA_01..10   production parameters
+ *   DATA0045  PROD_SPEC_01..20   customer part specifications
+ *   DATA0047  unit values, joined to DATA0002 for the unit and its description
+ */
+const PARAMS_SQL = `
+  SELECT TOP 1 * FROM DATA0044 WITH (NOLOCK)
+  WHERE SOURCE_PTR = @rkey AND SOURCE_TYPE = 2`
+
+const SPECS_SQL = `
+  SELECT TOP 1 * FROM DATA0045 WITH (NOLOCK)
+  WHERE SOURCE_PTR = @rkey AND SOURCE_TYPE = 2`
+
+const UNITS_SQL = `
+  SELECT
+    LTRIM(RTRIM(d2.UNIT_CODE))        AS unitCode,
+    LTRIM(RTRIM(d2.UNIT_DESCRIPTION)) AS unitDescription,
+    d47.UNIT_VALUE                    AS unitValue
+  FROM DATA0047 d47 WITH (NOLOCK)
+  LEFT JOIN DATA0002 d2 WITH (NOLOCK) ON d2.RKEY = d47.UNIT_POINTER
+  WHERE d47.SOURCE_POINTER = @rkey AND d47.TTYPE = 2
+  ORDER BY d2.UNIT_CODE`
+
 /** Notepad / discrepancy text for a customer part. */
 const NOTES_SQL = `
   SELECT LTRIM(RTRIM(d211.NOTEPAD_TEXT)) AS text
@@ -225,6 +273,28 @@ export async function buildCardSet(customerPart: string): Promise<CardData[]> {
     return { lines, children }
   }
 
+  /**
+   * PROD_PARA_nn / PROD_SPEC_nn are numbered columns. Rather than naming all
+   * thirty, take whatever numbered columns the row actually has — the count
+   * differs between Paradigm versions and a missing column would fail the
+   * whole query.
+   */
+  const numbered = (row: any, prefix: RegExp) => {
+    if (!row) return []
+    return Object.keys(row)
+      .filter(k => prefix.test(k))
+      .sort((a, b) => (parseInt(a.replace(/\D+/g, ''), 10) || 0) - (parseInt(b.replace(/\D+/g, ''), 10) || 0))
+      .map(k => ({ name: k.replace(/_/g, ' '), value: clean(row[k]) }))
+      .filter(p => p.value !== '')
+  }
+
+  const rkey = Number(h.RKEY ?? 0)
+  const [paraRow, specRow, unitRows] = await Promise.all([
+    queryMSSQL<any[]>('1', PARAMS_SQL, { rkey }).catch(() => []),
+    queryMSSQL<any[]>('1', SPECS_SQL, { rkey }).catch(() => []),
+    queryMSSQL<any[]>('1', UNITS_SQL, { rkey }).catch(() => []),
+  ])
+
   // Top card — the customer part.
   const topBom = await bomLines(Number(h.BOM_PTR))
   // TTYPE 4 is the released customer-part route.
@@ -239,12 +309,23 @@ export async function buildCardSet(customerPart: string): Promise<CardData[]> {
     customerName: clean(h.CUSTOMER_NAME),
     bomNumber: clean(h.BOM_PART),
     bomDescription: clean(h.BOM_DESC),
-    routeName: topRoute[0] ? `${topRoute[0].deptCode} ${topRoute[0].dept}`.trim() : '',
-    productCode: '',
+    routeCode: clean(h.ROUTE_CODE),
+    routeName: clean(h.ROUTE_NAME),
+    productCode: clean(h.PROD_CODE),
+    productName: clean(h.PROD_NAME),
     catalogNumber: clean(h.CATALOG_NUMBER),
+    modifiedBy: [clean(h.MODIFIED_BY_CODE), clean(h.MODIFIED_BY_NAME)].filter(Boolean).join(' '),
+    modifiedDate: h.MODIFIED_DATE ? new Date(h.MODIFIED_DATE).toLocaleDateString() : '',
     bom: topBom.lines,
     route: topRoute,
     notes: (notes || []).map(n => clean(n.text)).filter(Boolean),
+    parameters: numbered(paraRow?.[0], /^PROD_PARA_\d+$/i),
+    specs: numbered(specRow?.[0], /^PROD_SPEC_\d+$/i),
+    units: (unitRows || []).map(u => ({
+      code: clean(u.unitCode),
+      description: clean(u.unitDescription),
+      value: clean(u.unitValue),
+    })).filter(u => u.code),
   })
 
   // Manufactured components, depth-first.
@@ -272,15 +353,22 @@ export async function buildCardSet(customerPart: string): Promise<CardData[]> {
         customerName: clean(h.CUSTOMER_NAME),
         bomNumber: pn,
         bomDescription: clean(r.description),
+        routeCode: '',
         routeName: '',
-        productCode: '',
+        productCode: clean(h.PROD_CODE),
+        productName: clean(h.PROD_NAME),
         catalogNumber: clean(h.CATALOG_NUMBER),
+        modifiedBy: '',
+        modifiedDate: '',
         bom: sub.lines,
         // TTYPE 3 is the inventory-part route, keyed on DATA0017.RKEY — the
         // same join the Standards "related parts" query uses. TTYPE 1 (my
         // earlier guess) returns nothing, which is why these came out blank.
         route: await loadRoute(Number(r.rkey), 3),
         notes: [],
+        parameters: [],
+        specs: [],
+        units: [],
       })
       await walk(sub.children, level + 1)
     }

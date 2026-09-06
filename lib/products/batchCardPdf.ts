@@ -25,23 +25,28 @@ const BAND = rgb(0.85, 0.91, 0.97)
  * relying on a system font, since the runner image carries no font packages.
  * Falls back to Helvetica if the files are missing so a card still renders.
  */
-async function loadFonts(doc: PDFDocument): Promise<{ regular: PDFFont; bold: PDFFont }> {
+async function loadFonts(doc: PDFDocument): Promise<{
+  regular: PDFFont; bold: PDFFont; mono: PDFFont; monoBold: PDFFont
+}> {
   doc.registerFontkit(fontkit)
   const dir = path.join(process.cwd(), 'assets', 'fonts')
   try {
-    const [r, b] = await Promise.all([
+    const [r, b, m, mb] = await Promise.all([
       fs.readFile(path.join(dir, 'DejaVuSans.ttf')),
       fs.readFile(path.join(dir, 'DejaVuSans-Bold.ttf')),
+      fs.readFile(path.join(dir, 'DejaVuSansMono.ttf')),
+      fs.readFile(path.join(dir, 'DejaVuSansMono-Bold.ttf')),
     ])
     return {
       regular: await doc.embedFont(r, { subset: true }),
       bold: await doc.embedFont(b, { subset: true }),
+      mono: await doc.embedFont(m, { subset: true }),
+      monoBold: await doc.embedFont(mb, { subset: true }),
     }
   } catch {
-    return {
-      regular: await doc.embedFont(StandardFonts.Helvetica),
-      bold: await doc.embedFont(StandardFonts.HelveticaBold),
-    }
+    const h = await doc.embedFont(StandardFonts.Helvetica)
+    const hb = await doc.embedFont(StandardFonts.HelveticaBold)
+    return { regular: h, bold: hb, mono: h, monoBold: hb }
   }
 }
 
@@ -53,7 +58,7 @@ export type CardMeta = {
 
 export async function renderBatchCard(card: CardData, meta: CardMeta): Promise<Uint8Array> {
   const doc = await PDFDocument.create()
-  const { regular, bold } = await loadFonts(doc)
+  const { regular, bold, mono, monoBold } = await loadFonts(doc)
 
   const pages: PDFPage[] = []
   let page!: PDFPage
@@ -72,44 +77,79 @@ export async function renderBatchCard(card: CardData, meta: CardMeta): Promise<U
   const label = (s: string, x: number, yy: number) =>
     page.drawText(s, { x, y: yy, size: 7, font: bold, color: MUTED })
 
-  /** The block that repeats on every page. Returns the y to continue from. */
+  /**
+   * The block that repeats on every page — only the page number changes, since
+   * a card gets separated in the shop and any loose sheet has to identify
+   * itself. Returns the y to continue from.
+   *
+   * The right-hand column has its COLONS aligned, matching the Paradigm
+   * printout: labels are right-aligned to a colon column, values start after it.
+   */
   const drawHeader = () => {
     let hy = PAGE.h - M
 
-    // Centre column: company, system, document title
-    const centre = (s: string, size: number, f: PDFFont, yy: number) => {
-      const w = f.widthOfTextAtSize(s, size)
-      page.drawText(s, { x: (PAGE.w - w) / 2, y: yy, size, font: f, color: INK })
+    const centre = (str: string, size: number, f: PDFFont, yy: number) => {
+      const w = f.widthOfTextAtSize(str, size)
+      page.drawText(str, { x: (PAGE.w - w) / 2, y: yy, size, font: f, color: INK })
     }
-    centre('Amphenol Printed Circuits, Inc.', 10, bold, hy)
-    // Right column: ID / Page / timestamp
-    page.drawText(`ID : ${meta.employeeId || '-'}`, { x: PAGE.w - M - 120, y: hy, size: 8, font: regular, color: INK })
+    // Right column with a fixed colon position.
+    const COLON_X = PAGE.w - M - 52
+    const rightPair = (lbl: string, val: string, yy: number) => {
+      const w = mono.widthOfTextAtSize(lbl, 8)
+      page.drawText(lbl, { x: COLON_X - 4 - w, y: yy, size: 8, font: mono, color: INK })
+      page.drawText(':', { x: COLON_X, y: yy, size: 8, font: mono, color: INK })
+      page.drawText(String(val ?? ''), { x: COLON_X + 8, y: yy, size: 8, font: mono, color: INK })
+    }
+
+    centre('Amphenol Printed Circuits, Inc.', 10, monoBold, hy)
+    rightPair('ID', meta.employeeId || '-', hy)
     hy -= 11
-    centre('4.0 Live', 8, regular, hy)
-    page.drawText(`Page : ${pages.length}`, { x: PAGE.w - M - 120, y: hy, size: 8, font: regular, color: INK })
+    centre('4.0 Live', 8, mono, hy)
+    rightPair('Page', String(pages.length), hy)
     hy -= 11
-    centre('BATCH CARD', 10, bold, hy)
-    page.drawText(new Date().toLocaleString(), { x: PAGE.w - M - 120, y: hy, size: 8, font: regular, color: INK })
+    centre('CUSTOMER PART DETAILS', 10, monoBold, hy)
+    page.drawText(new Date().toLocaleString(), {
+      x: COLON_X - 4 - mono.widthOfTextAtSize(new Date().toLocaleString(), 8) + 60,
+      y: hy, size: 8, font: mono, color: INK,
+    })
     hy -= 16
 
-    // Left-aligned field block, labels right-aligned against their values
-    const row = (lbl: string, val: string, lbl2?: string, val2?: string) => {
-      const lw = bold.widthOfTextAtSize(lbl, 8)
-      page.drawText(lbl, { x: 150 - lw, y: hy, size: 8, font: bold, color: INK })
-      page.drawText(String(val ?? ''), { x: 156, y: hy, size: 8, font: regular, color: INK })
+    // Left field block: labels right-aligned to a colon column.
+    const L_COLON = 150
+    const row = (lbl: string, val: string, lblBold = true, lbl2?: string, val2?: string) => {
+      const f = lblBold ? monoBold : mono
+      const w = f.widthOfTextAtSize(lbl, 8)
+      page.drawText(lbl, { x: L_COLON - 4 - w, y: hy, size: 8, font: f, color: INK })
+      page.drawText(':', { x: L_COLON, y: hy, size: 8, font: f, color: INK })
+      page.drawText(String(val ?? ''), { x: L_COLON + 8, y: hy, size: 8, font: mono, color: INK })
       if (lbl2) {
-        const lw2 = bold.widthOfTextAtSize(lbl2, 8)
-        page.drawText(lbl2, { x: 470 - lw2, y: hy, size: 8, font: bold, color: INK })
-        page.drawText(String(val2 ?? ''), { x: 476, y: hy, size: 8, font: regular, color: INK })
+        const w2 = monoBold.widthOfTextAtSize(lbl2, 8)
+        page.drawText(lbl2, { x: 470 - w2, y: hy, size: 8, font: monoBold, color: INK })
+        page.drawText(':', { x: 474, y: hy, size: 8, font: monoBold, color: INK })
+        page.drawText(String(val2 ?? ''), { x: 482, y: hy, size: 8, font: mono, color: INK })
       }
       hy -= 11
     }
-    row('Customer :', `${card.customerCode}   ${card.customerName}`)
-    row('Part Number :', card.partNumber, 'Part Revision :', card.revision)
-    row('Part Description :', card.description)
-    row('BOM Number :', card.bomNumber, 'BOM Revision :', '')
-    row('BOM Description :', card.bomDescription)
-    if (card.routeName) row('Route :', card.routeName)
+
+    row('Customer', `${card.customerCode}   ${card.customerName}`)
+    row('Part Number', card.partNumber, true, 'Part Revision', card.revision)
+    row('Part Description', card.description)
+    row('BOM Number', card.bomNumber, true, 'BOM Revision', '')
+    row('BOM Description', card.bomDescription)
+    // Route and Product Code are NOT bold on the original printout.
+    if (card.routeCode || card.routeName) {
+      row('Route', `${card.routeCode}      ${card.routeName}`.trim(), false,
+          undefined, undefined)
+    }
+    if (card.productCode || card.productName) {
+      row('Product Code', `${card.productCode}   ${card.productName}`.trim(), false)
+    }
+    if (card.catalogNumber) {
+      row('Catalog Number', card.catalogNumber, true)
+    }
+    if (card.modifiedBy || card.modifiedDate) {
+      row('Last Modified By', card.modifiedBy, true, 'Modified Date', card.modifiedDate)
+    }
 
     hy -= 4
     page.drawLine({ start: { x: M, y: hy }, end: { x: PAGE.w - M, y: hy }, thickness: 1, color: INK })
@@ -124,6 +164,50 @@ export async function renderBatchCard(card: CardData, meta: CardMeta): Promise<U
   const need = (h: number) => { if (y - h < M) newPage() }
 
   newPage()
+
+  const band = (title: string) => {
+    need(24)
+    page.drawRectangle({ x: M, y: y - 3, width: PAGE.w - 2 * M, height: 13, color: BAND })
+    const w = bold.widthOfTextAtSize(title, 8.5)
+    text(title, (PAGE.w - w) / 2, 8.5, bold)
+    y -= 16
+  }
+
+  // Two-column list, for the parameter / spec blocks.
+  const pairs = (list: { name: string; value: string }[]) => {
+    const half = Math.ceil(list.length / 2)
+    for (let i = 0; i < half; i++) {
+      need(11)
+      const a = list[i], b = list[i + half]
+      if (a) {
+        text(a.name, M + 6, 7, regular, MUTED)
+        text(a.value, M + 120, 7.5)
+      }
+      if (b) {
+        text(b.name, M + 290, 7, regular, MUTED)
+        text(b.value, M + 400, 7.5)
+      }
+      y -= 10
+    }
+    y -= 4
+  }
+
+  if (card.parameters.length) { band('Production Part Parameters'); pairs(card.parameters) }
+  if (card.specs.length) { band('Customer Part Specifications'); pairs(card.specs) }
+  if (card.units.length) {
+    band('Unit Loading Factors')
+    label('Unit Name', M + 6, y); label('Unit Code', M + 250, y)
+    label('Part Loading Factor', M + 360, y)
+    y -= 3; rule(); y -= 10
+    for (const u of card.units) {
+      need(11)
+      text(u.description, M + 6, 7.5)
+      text(u.code, M + 250, 7.5)
+      text(u.value, M + 360, 7.5)
+      y -= 10
+    }
+    y -= 4
+  }
 
   // ---- Bill of material ----
   if (card.bom.length) {
@@ -203,10 +287,6 @@ export async function renderBatchCard(card: CardData, meta: CardMeta): Promise<U
     const right = `Paradigm® Version 4.0`
     p.drawText(right, {
       x: PAGE.w - M - regular.widthOfTextAtSize(right, 7), y: 24, size: 7, font: regular, color: MUTED,
-    })
-    // Page N of M, sitting under the header's Page label
-    p.drawText(`${i + 1} of ${pages.length}`, {
-      x: PAGE.w - M - 60, y: PAGE.h - M - 11, size: 8, font: regular, color: INK,
     })
   })
 
